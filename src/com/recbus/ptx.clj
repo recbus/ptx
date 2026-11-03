@@ -10,88 +10,114 @@
   of communicating: the database itself.
 
   The name `ptx` could as well mean \"pseudo-transaction\" since a ptx is only
-  ever transacted in isolation speculatively.  The resulting with-db database
-  forms the input to the next ptx, and so on.  A ptx exists only to produce
+  ever transacted speculatively.  Each ptx is evaluated against the database
+  produced by *replaying* the tx-data of all preceding ptxs, as a single
+  transaction, against the original database.  A ptx exists only to produce
   tx-data and only sees the tx-data of a preceding ptx the same way it sees
   *all* facts: the database.
 
-  Collectively, the tx-data from the execution of a sequence of ptxs is
+  Because every replay applies the accumulated tx-data as one transaction
+  against the original database, tempids unify natively and the speculative
+  database seen by each ptx has exactly the semantics of the final transaction.
+
+  Collectively, the tx-data from the evaluation of a sequence of ptxs is
   collected into a single tx-data result which can then be properly transacted."
-  (:require [clojure.set]
+  (:require [clojure.walk :as walk]
             [datomic.client.api :as d]))
 
-(defn- resolve-v-tempids
-  [{:keys [refs trefs]} resolve a v]
-  (cond
-    (refs a) (resolve v)
-    (trefs a) (let [i (trefs a)
-                    v' (v i)] ; TODO: double-t-nested refs?
-                (assoc v i (resolve v')))
-    :else v))
+(defn- invocation?
+  "Is `x` a ptx-fn invocation: a list (or other seq, e.g. the lazy seqs produced
+  by the Datomic Cloud tx processor) with a qualified symbol in function position?"
+  [x]
+  (and (seq? x) (qualified-symbol? (first x))))
 
-(defn- resolve-primitive-datom
-  [schema resolve [cmd e a v :as x]]
-  (if (= 3 (count x)) ; support short-form :db/retract without a v
-    [cmd (resolve e) a]
-    [cmd (resolve e) a (resolve-v-tempids schema resolve a v)]))
+(declare expand)
 
-(defmulti resolve-tx-datum
-  "Transform the tx-datum by replacing all tempids with their realized db ids."
-  (fn [_schema _resolve [cmd]] cmd))
-(defmethod resolve-tx-datum :db/add [& args] (apply resolve-primitive-datom args))
-
-;; Do not resolve retractions. Retractions on tempids are no-ops, even if the entity exists prior to
-;; the transaction, so there's no possible utility to resolving a :db/id in a retraction.
-(defmethod resolve-tx-datum :db/retract [_ _ assertion] assertion)
-(defmethod resolve-tx-datum :db/retractEntity [_ _ [cmd e]] [cmd e])
-
-(defmethod resolve-tx-datum :db/cas
-  [schema resolve [cmd e a v0 v1]]
-  [cmd (resolve e) a (resolve-v-tempids schema resolve a v0) (resolve-v-tempids schema resolve a v1)])
-
-(defn- lookup-ref?
-  [v]
-  (and (vector? v)
-       (= 2 (count v))
-       (-> v first qualified-keyword?)
-       (-> v second some?)))
-
-(declare reduce-entity)
-(defn reduce-map-entry
-  [{:keys [tuples refs cardinality-many] :as schema} peid [k v]]
-  (cond
-    (map? v) (reduce-entity schema peid k v)
-    (coll? v) (cond (tuples k) [[:db/add peid k v]] ; no support for composite tuples with refs
-                    (refs k) (cond
-                               (lookup-ref? v) [[:db/add peid k v]]
-                               (cardinality-many k) (into [] (mapcat (fn [v] (reduce-entity schema peid k v)) v))
-                               :else (throw (ex-info "Unhandled ref value!" {:peid peid :k k :v v :schema schema})))
-                    (cardinality-many k) (into [] (map (fn [v] [:db/add peid k v]) v))
-                    :else (throw (ex-info "Unhandled collection!" {:peid peid :k k :v v :schema schema})))
-    :else [[:db/add peid k v]]))
-
-(def eid? (some-fn nat-int? keyword? lookup-ref? string?))
-
-(defn reduce-entity
-  [schema peid pk v]
-  (cond
-    (map? v) (let [{eid :db/id :or {eid (str (gensym "$$auto-tempid-"))} :as m} v
-                   binds (if peid [[:db/add peid pk eid]] [])]
-               (into binds (mapcat (fn [me] (reduce-map-entry schema eid me)) (dissoc m :db/id))))
-    (eid? v) [[:db/add peid pk v]]))
-
-(defmulti expand (fn [_context x] (class x)))
-(defmethod expand clojure.lang.IPersistentMap [{:keys [schema]} m] (reduce-entity schema nil nil m))
-(defmethod expand clojure.lang.IPersistentVector [_context v] [v]) ; primitive
-(defmethod expand clojure.lang.IPersistentList
+(defn- invoke
+  "Evaluate the ptx-fn invocation `expression` in `context` and recursively expand
+  the ptx it returns."
   [context [op & args :as expression]]
-  (if-let [f (requiring-resolve op)]
-    (let [ptx (apply f context args)]
-      (into [] (mapcat (partial expand context)) ptx))
-    (throw (ex-info (format "The ptx transaction function %s was not resolved." op) {:expression expression}))))
-(defmethod expand clojure.lang.LazySeq ; the tx processor in Cloud turns tx-data lists into lazy seqs apparently.
-  [context args]
-  (expand context (apply list args)))
+  (let [f (or (requiring-resolve op)
+              (throw (ex-info (format "The ptx-fn %s was not resolved." op)
+                              {::expression expression})))]
+    (into [] (mapcat (partial expand context)) (apply f context args))))
+
+(defn- expand
+  "Expand the ptx element `x` into tx-data.  ptx-fn invocations are evaluated;
+  every other element passes through unchanged for Datomic to interpret."
+  [context x]
+  (if (invocation? x) (invoke context x) [x]))
+
+(defn- unresolve-all
+  "Replace every speculative eid in the tx-data `x` with its tempid.
+
+  The walk is deliberately blind to the structure of `x`: every integer is
+  checked, regardless of position.  A speculative eid is only meaningful in an
+  entity position, where replacing it with its tempid is exactly right.  In any
+  other position a (vanishingly unlikely) collision becomes a tempid string where
+  Datomic expects a non-entity value, which Datomic rejects loudly wherever the
+  schema types the value.  The exception is untyped data, such as the arguments
+  of a classic tx-fn invoked in vector form, where a collision would go unnoticed.
+
+  Only the speculative eids of *new* entities are replaced.  The eids of
+  pre-existing entities (including upsert targets) are valid everywhere and are
+  left alone; replacing them would break, e.g., `:db/cas`, which Datomic
+  evaluates before resolving tempids by upsert."
+  [{:keys [tempids unresolve]} x]
+  (if (empty? tempids)
+    x
+    (walk/postwalk (fn [v] (if (integer? v) (unresolve v) v)) x)))
+
+(defn- expand-ptx
+  "Expand `ptx` into tx-data.  The output of each ptx-fn invocation has its
+  speculative eids mapped back to tempids; literal tx-data cannot contain
+  speculative eids and is passed through untouched."
+  [context ptx]
+  (into []
+        (mapcat (fn [x] (if (invocation? x)
+                          (unresolve-all context (invoke context x))
+                          [x])))
+        ptx))
+
+(defn- existing-entity?
+  "Does entity `eid` have any datoms in `db`?"
+  [db eid]
+  (boolean (seq (d/datoms db {:index :eavt :components [eid] :limit 1}))))
+
+(defn- ptx-context
+  "Build the ptx-fn context from the speculative transaction report of a replay.
+  `existing?` is a predicate identifying entities that exist in the original
+  database; only *new* entities have speculative eids that need unresolving."
+  [existing? {:keys [db-after tempids]}]
+  (let [tempid-of (into {}
+                        (keep (fn [[tempid eid]] (when-not (existing? eid) [eid tempid])))
+                        tempids)]
+    {:$ db-after
+     :tempids tempids
+     :resolve (fn resolve-tempid [x] (get tempids x x))
+     :unresolve (fn unresolve-eid [x] (get tempid-of x x))}))
+
+(defn- fail
+  [index tx-data cause]
+  (throw (ex-info "Partial transaction failed."
+                  (cond-> {::ptx-index index} tx-data (assoc ::tx-data tx-data))
+                  cause)))
+
+(defn- apply-ptxs
+  "Evaluate `ptxs` in order against `db` and return the accumulated tx-data.  Each
+  ptx is evaluated in a context whose database is `db` with the tx-data of all
+  preceding ptxs applied as a single (speculative) transaction."
+  [db ptxs]
+  (let [existing? (memoize (partial existing-entity? db))]
+    (:tx-data (reduce (fn [{:keys [context tx-data]} [index ptx]]
+                        (let [tx-data' (try (expand-ptx context ptx)
+                                            (catch Exception e (fail index nil e)))
+                              tx-data (into tx-data tx-data')
+                              report (try (d/with db {:tx-data tx-data})
+                                          (catch Exception e (fail index tx-data' e)))]
+                          {:context (ptx-context existing? report) :tx-data tx-data}))
+                      {:context (ptx-context existing? {:db-after db :tempids {}}) :tx-data []}
+                      (map-indexed vector ptxs)))))
 
 (defn |+
   "A ptx-fn that wraps standard Datomic classpath tx-fns that have no dependency
@@ -100,107 +126,9 @@
   (let [f (requiring-resolve f)]
     (apply f $ args)))
 
-(defn ||
-  "A ptx-fn that generates Datomic transaction data (tx-data) from a sequence of
-  partial transactions `ptxs`."
-  [context & ptxs]
-  (try (let [apply-ptx (fn apply-ptx ; TODO: virtual attributes
-                         [[{:keys [$ schema tempids resolve] :as context} tx-data] ptx]
-                         (let [tx-data' (sequence (mapcat (partial expand context)) ptx) ; recursive!
-                               resolve-tx-datum (partial resolve-tx-datum schema resolve)
-                               resolved-tx-data (sequence (map resolve-tx-datum) tx-data')
-                               tx-report (try (d/with $ {:tx-data resolved-tx-data})
-                                              (catch Exception e
-                                                (throw (ex-info "Partial transaction failed."
-                                                                {::tx-data tx-data'
-                                                                 ::resolved-tx-data resolved-tx-data}
-                                                                e))))
-                               tempids (merge tempids (:tempids tx-report))]
-                           [(assoc context
-                                   :$ (:db-after tx-report)
-                                   :tempids tempids
-                                   :resolve (fn resolve-eid [eid] (tempids eid eid)))
-                            (concat tx-data tx-data')]))
-             [{:keys [tempids schema]} tx-data] (reduce
-                                                 apply-ptx
-                                                 [context []]
-                                                 ptxs)
-             reverse-resolve (fn reverse-resolve [eid] ((clojure.set/map-invert tempids) eid eid))]
-         (into [] (map (partial resolve-tx-datum schema reverse-resolve)) tx-data))
-       (catch Exception e
-         (throw (Exception. "Partial transaction application failed." e)))))
-
-(defn- schema
-  "Return a summary of the database schema essential for the evaluation of
-  partial transactions.  It is computed once per invocation of `|`."
-  [db]
-  (let [attrs (d/q {:query '{:find [?type ?attr ?card]
-                             :in [$]
-                             :where [[?a :db/valueType ?t]
-                                     [?a :db/cardinality ?c]
-                                     [?c :db/ident ?card]
-                                     [?t :db/ident ?type]
-                                     [?a :db/ident ?attr]]}
-                    :args [db]})
-        trefs (into {}
-                    (map (fn [[tattr attr tattrs]] [tattr (.indexOf tattrs attr)]))
-                    (d/q {:query '{:find [?tattr ?a ?as]
-                                   :in [$]
-                                   :where [[?ta :db/valueType :db.type/tuple]
-                                           [?ta :db/tupleAttrs ?as]
-                                           [?ta :db/ident ?tattr]
-                                           [(untuple ?as) [?a ...]]
-                                           [?a :db/valueType :db.type/ref]
-                                           [?a :db/ident ?attr]]}
-                          :args [db]}))
-        by-type (group-by first attrs)
-        by-card (group-by (fn [[_ _ c]] c) attrs)]
-    {:refs (into #{} (map second) (:db.type/ref by-type))
-     :tuples (into #{} (map second) (:db.type/tuple by-type))
-     :cardinality-many (into #{} (map second) (:db.cardinality/many by-card))
-     :cardinality-one (into #{} (map second) (:db.cardinality/one by-card))
-     :trefs trefs}))
-
 ;; The sole entry point.
 (defn |
   "A Datomic tx-fn that generates tx-data from `ptxs`, a sequence of partial
   transactions."
-  [$ & ptxs]
-  (let [context {:$ $
-                 :schema (schema $) ; performance optimization; a function of $ only.
-                 :tempids {}
-                 :resolve identity}]
-    (apply || context ptxs)))
-
-(comment ["Decision Tree"
-          ["Composition of partial transactions..."
-           ["...implies tempid unification across partials..."
-            ["...which requires arbitrary tx-fn re-writing..."
-             ["...which requires data available only in the context..."
-              ["...which amortizes a path to recursive partials."]]]]]])
-
-(comment [["Goals:"
-           ["Construct derivative transaction deltas (tx-data) that are functions of previously proposed tx-data and the current database."
-            "Allow complex tx-data functions to be decomposed and recomposed."
-            "Preserve the semantic model of existing transactions: monoidal accretion with applicative expansion of tx-data deltas."]]
-          ["Anti-Goals:"
-           ["* generalized (Turing Complete?) DSL for constructing datoms."
-            "* detect & \"correct\" conflicting facts in a single transaction (leave that to transactor)."
-            ["* improve transaction performance by pre-resolving transaction functions to primitive tx-data..."
-             "...but it is a nice side-effect and could play very nicely with hints."]]]
-          ["Semantic Preservation Restrictions: "
-           ["a partial transaction is a collection of tx-data elements."
-            "a partial transaction supports all Datomic tx-data (:db/add et al)."
-            "a partial transaction is composed of either primitive Datomic assertions or expressions that evaluate to primitives."
-            "sibling partials are evaluated independently."
-            "sibling partial expressions have (read-only) access to the same with-db database."
-            "partial transactions can only accrete elements onto their containing tx-data."]]
-          ["Processing Model extension: recursively nested scopes."
-           ["expressions produce proposed datoms."
-            "partial transactions support functions whose first parameter is a context that includes the cumulatively accreted speculative database of its ancestors (and a tempid cross-reference map)."
-            "an expression in a child scope has read access to the cumulative datoms proposed by ancestor scopes."
-            "an expression cannot modify the contents of ancestor scopes."]]
-          ["Restrictions:"
-           ["Partial transactions must be ordered topologically by dependency."
-            "Traditional transaction functions must be wrapped to forward-resolve tempid arguments."
-            "The ptx evaluation environment is opt-in and must be entered by tx-data that invokes the `com.recbus.ptx/|` tx-fn with partial transaction (ptx) varargs."]]])
+  [db & ptxs]
+  (apply-ptxs db ptxs))

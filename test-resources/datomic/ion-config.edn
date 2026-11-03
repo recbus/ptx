@@ -1,0 +1,6 @@
+;; Datomic Local enforces :xforms for pull; Datomic Cloud additionally requires
+;; tx-fns (com.recbus.ptx/|) to be listed under :allow.
+{:allow [com.recbus.ptx/|]
+ :xforms [clojure.core/set]
+ :lambdas {}
+ :app-name "ptx-test"}
