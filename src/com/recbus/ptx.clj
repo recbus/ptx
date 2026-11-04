@@ -63,19 +63,19 @@
   pre-existing entities (including upsert targets) are valid everywhere and are
   left alone; replacing them would break, e.g., `:db/cas`, which Datomic
   evaluates before resolving tempids by upsert."
-  [{:keys [tempids unresolve]} x]
-  (if (empty? tempids)
+  [tempid-of x]
+  (if (empty? tempid-of)
     x
-    (walk/postwalk (fn [v] (if (integer? v) (unresolve v) v)) x)))
+    (walk/postwalk (fn [v] (if (integer? v) (get tempid-of v v) v)) x)))
 
 (defn- expand-ptx
   "Expand `ptx` into tx-data.  The output of each ptx-fn invocation has its
-  speculative eids mapped back to tempids; literal tx-data cannot contain
-  speculative eids and is passed through untouched."
-  [context ptx]
+  speculative eids mapped back to tempids using `tempid-of`; literal tx-data
+  cannot contain speculative eids and is passed through untouched."
+  [context tempid-of ptx]
   (into []
         (mapcat (fn [x] (if (invocation? x)
-                          (unresolve-all context (invoke context x))
+                          (unresolve-all tempid-of (invoke context x))
                           [x])))
         ptx))
 
@@ -84,18 +84,19 @@
   [db eid]
   (boolean (seq (d/datoms db {:index :eavt :components [eid] :limit 1}))))
 
-(defn- ptx-context
-  "Build the ptx-fn context from the speculative transaction report of a replay.
-  `existing?` is a predicate identifying entities that exist in the original
-  database; only *new* entities have speculative eids that need unresolving."
+(defn- replay-state
+  "Build the state for evaluating the next ptx from the speculative transaction
+  report of a replay: the ptx-fn context and `tempid-of`, the map from the
+  speculative eids of *new* entities to their tempids.  `existing?` is a
+  predicate identifying entities that exist in the original database."
   [existing? {:keys [db-after tempids]}]
   (let [tempid-of (into {}
                         (keep (fn [[tempid eid]] (when-not (existing? eid) [eid tempid])))
                         tempids)]
-    {:$ db-after
-     :tempids tempids
-     :resolve (fn resolve-tempid [x] (get tempids x x))
-     :unresolve (fn unresolve-eid [x] (get tempid-of x x))}))
+    {:context {:$ db-after
+               :resolve (fn resolve-tempid [x] (get tempids x x))
+               :unresolve (fn unresolve-eid [x] (get tempid-of x x))}
+     :tempid-of tempid-of}))
 
 (defn- fail
   [index tx-data cause]
@@ -109,14 +110,14 @@
   preceding ptxs applied as a single (speculative) transaction."
   [db ptxs]
   (let [existing? (memoize (partial existing-entity? db))]
-    (:tx-data (reduce (fn [{:keys [context tx-data]} [index ptx]]
-                        (let [tx-data' (try (expand-ptx context ptx)
+    (:tx-data (reduce (fn [{:keys [context tempid-of tx-data]} [index ptx]]
+                        (let [tx-data' (try (expand-ptx context tempid-of ptx)
                                             (catch Exception e (fail index nil e)))
                               tx-data (into tx-data tx-data')
                               report (try (d/with db {:tx-data tx-data})
                                           (catch Exception e (fail index tx-data' e)))]
-                          {:context (ptx-context existing? report) :tx-data tx-data}))
-                      {:context (ptx-context existing? {:db-after db :tempids {}}) :tx-data []}
+                          (assoc (replay-state existing? report) :tx-data tx-data)))
+                      (assoc (replay-state existing? {:db-after db :tempids {}}) :tx-data [])
                       (map-indexed vector ptxs)))))
 
 (defn |+

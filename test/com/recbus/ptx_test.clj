@@ -114,6 +114,8 @@
                     :other (unresolve :some/ident)})
   [])
 
+(defn capture-context [context] (reset! captured context) [])
+
 (defn boom [_context] (throw (ex-info "boom" {})))
 
 ;;; Tests
@@ -151,6 +153,9 @@
     (testing "nested invocations are expanded recursively"
       (is (= [[:db/add "order" :order/description "Test"]]
              (sut/| db [(list `f0 [(list `f0 [[:db/add "order" :order/description "Test"]])])]))))
+    (testing "ptx-fns receive a context of exactly :$, :resolve and :unresolve"
+      (sut/| db [(list `capture-context)])
+      (is (= #{:$ :resolve :unresolve} (set (keys @captured)))))
     (testing "an unresolvable ptx-fn fails"
       (is (match? {:message "Partial transaction failed."
                    :data {::sut/ptx-index 0}

@@ -88,7 +88,6 @@ The context contains:
 * `:unresolve`: the inverse of `:resolve`. It maps the speculative entity id of
   an entity created by an earlier ptx back to its tempid. Values it doesn't
   recognize are returned unchanged.
-* `:tempids`: the tempid → speculative entity id map.
 
 ```clojure
 (defn enumerate-lines
