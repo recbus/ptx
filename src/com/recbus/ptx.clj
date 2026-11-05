@@ -20,6 +20,11 @@
   against the original database, tempids unify natively and the speculative
   database seen by each ptx has exactly the semantics of the final transaction.
 
+  A ptx-fn has the same signature as a classic Datomic tx-fn, `(f db & args)`,
+  where `db` is the speculative database.  Arguments that refer to tempids of
+  earlier ptxs are marked at the call site as `[:db/id \"tempid\"]` and are
+  resolved to speculative entity ids before the ptx-fn is called.
+
   Collectively, the tx-data from the evaluation of a sequence of ptxs is
   collected into a single tx-data result which can then be properly transacted."
   (:require [clojure.walk :as walk]
@@ -31,22 +36,41 @@
   [x]
   (and (seq? x) (qualified-symbol? (first x))))
 
+(defn- mark?
+  "Is `x` a tempid mark: a two-element vector `[:db/id \"tempid\"]`?  Map entries
+  are excluded so that map arguments containing a `:db/id` are left alone, and
+  only strings qualify so that, e.g., pull patterns are left alone."
+  [x]
+  (and (vector? x)
+       (not (map-entry? x))
+       (= 2 (count x))
+       (= :db/id (first x))
+       (string? (second x))))
+
+(defn- resolve-marks
+  "Replace every tempid mark in `args` with the speculative entity id of its
+  tempid, or with the bare tempid if no earlier ptx used it."
+  [tempids args]
+  (walk/postwalk (fn [x] (if (mark? x) (let [tempid (second x)] (get tempids tempid tempid)) x))
+                 args))
+
 (declare expand)
 
 (defn- invoke
-  "Evaluate the ptx-fn invocation `expression` in `context` and recursively expand
-  the ptx it returns."
-  [context [op & args :as expression]]
+  "Call the ptx-fn of `expression` with the speculative database of `state` and
+  the expression's arguments (marks resolved), and recursively expand the ptx it
+  returns."
+  [{:keys [db tempids] :as state} [op & args :as expression]]
   (let [f (or (requiring-resolve op)
               (throw (ex-info (format "The ptx-fn %s was not resolved." op)
                               {::expression expression})))]
-    (into [] (mapcat (partial expand context)) (apply f context args))))
+    (into [] (mapcat (partial expand state)) (apply f db (resolve-marks tempids args)))))
 
 (defn- expand
   "Expand the ptx element `x` into tx-data.  ptx-fn invocations are evaluated;
   every other element passes through unchanged for Datomic to interpret."
-  [context x]
-  (if (invocation? x) (invoke context x) [x]))
+  [state x]
+  (if (invocation? x) (invoke state x) [x]))
 
 (defn- unresolve-all
   "Replace every speculative eid in the tx-data `x` with its tempid.
@@ -70,12 +94,12 @@
 
 (defn- expand-ptx
   "Expand `ptx` into tx-data.  The output of each ptx-fn invocation has its
-  speculative eids mapped back to tempids using `tempid-of`; literal tx-data
-  cannot contain speculative eids and is passed through untouched."
-  [context tempid-of ptx]
+  speculative eids mapped back to tempids; literal tx-data cannot contain
+  speculative eids and is passed through untouched."
+  [{:keys [tempid-of] :as state} ptx]
   (into []
         (mapcat (fn [x] (if (invocation? x)
-                          (unresolve-all tempid-of (invoke context x))
+                          (unresolve-all tempid-of (invoke state x))
                           [x])))
         ptx))
 
@@ -86,17 +110,16 @@
 
 (defn- replay-state
   "Build the state for evaluating the next ptx from the speculative transaction
-  report of a replay: the ptx-fn context and `tempid-of`, the map from the
-  speculative eids of *new* entities to their tempids.  `existing?` is a
-  predicate identifying entities that exist in the original database."
+  report of a replay: the speculative database, the tempid -> speculative eid map,
+  and `tempid-of`, the map from the speculative eids of *new* entities to their
+  tempids.  `existing?` is a predicate identifying entities that exist in the
+  original database."
   [existing? {:keys [db-after tempids]}]
-  (let [tempid-of (into {}
-                        (keep (fn [[tempid eid]] (when-not (existing? eid) [eid tempid])))
-                        tempids)]
-    {:context {:$ db-after
-               :resolve (fn resolve-tempid [x] (get tempids x x))
-               :unresolve (fn unresolve-eid [x] (get tempid-of x x))}
-     :tempid-of tempid-of}))
+  {:db db-after
+   :tempids tempids
+   :tempid-of (into {}
+                    (keep (fn [[tempid eid]] (when-not (existing? eid) [eid tempid])))
+                    tempids)})
 
 (defn- fail
   [index tx-data cause]
@@ -106,12 +129,12 @@
 
 (defn- apply-ptxs
   "Evaluate `ptxs` in order against `db` and return the accumulated tx-data.  Each
-  ptx is evaluated in a context whose database is `db` with the tx-data of all
-  preceding ptxs applied as a single (speculative) transaction."
+  ptx is evaluated against `db` with the tx-data of all preceding ptxs applied as
+  a single (speculative) transaction."
   [db ptxs]
   (let [existing? (memoize (partial existing-entity? db))]
-    (:tx-data (reduce (fn [{:keys [context tempid-of tx-data]} [index ptx]]
-                        (let [tx-data' (try (expand-ptx context tempid-of ptx)
+    (:tx-data (reduce (fn [{:keys [tx-data] :as state} [index ptx]]
+                        (let [tx-data' (try (expand-ptx state ptx)
                                             (catch Exception e (fail index nil e)))
                               tx-data (into tx-data tx-data')
                               report (try (d/with db {:tx-data tx-data})
@@ -119,13 +142,6 @@
                           (assoc (replay-state existing? report) :tx-data tx-data)))
                       (assoc (replay-state existing? {:db-after db :tempids {}}) :tx-data [])
                       (map-indexed vector ptxs)))))
-
-(defn |+
-  "A ptx-fn that wraps standard Datomic classpath tx-fns that have no dependency
-  on tempids."
-  [{:keys [$]} f & args]
-  (let [f (requiring-resolve f)]
-    (apply f $ args)))
 
 ;; The sole entry point.
 (defn |

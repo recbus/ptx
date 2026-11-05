@@ -72,51 +72,44 @@
 
 ;;; ptx-fns used by the tests
 
-(defn f0 [_context tx] tx)
+(defn f0 [_db tx] tx)
 
-(defn emit-resolved
-  "Emit an assertion using the resolved (speculative) eids of `e` and `v`."
-  [{:keys [resolve]} e a v]
-  [[:db/add (resolve e) a (resolve v)]])
+(defn emit
+  "Emit an assertion of `v` for `a` of `e`, as given."
+  [_db e a v]
+  [[:db/add e a v]])
 
-(defn emit-resolved-map
-  "Like `emit-resolved`, but in map form."
-  [{:keys [resolve]} e a v]
-  [{:db/id (resolve e) a (resolve v)}])
+(defn emit-map
+  "Like `emit`, but in map form."
+  [_db e a v]
+  [{:db/id e a v}])
 
-(defn emit-resolved-tuple
-  "Emit a tuple assertion with the resolved (speculative) eid of `s` as a ref component."
-  [{:keys [resolve]} e s rank]
-  [[:db/add (resolve e) :order/supplier+rank [(resolve s) rank]]])
+(defn emit-tuple
+  "Emit a tuple assertion with `s` as a ref component."
+  [_db e s rank]
+  [[:db/add e :order/supplier+rank [s rank]]])
 
-(defn emit-resolved-cas
-  "Emit a :db/cas using the resolved eid of `e`."
-  [{:keys [resolve]} e a old new]
-  [[:db/cas (resolve e) a old new]])
+(defn emit-cas
+  "Emit a :db/cas against `e`."
+  [_db e a old new]
+  [[:db/cas e a old new]])
 
 (defn describe
   "Read the :order/id of `e` from the speculative database and describe it."
-  [{:keys [$ resolve]} e]
-  (let [{:order/keys [id]} (d/pull $ [:order/id] (resolve e))]
+  [db e]
+  (let [{:order/keys [id]} (d/pull db [:order/id] e)]
     [[:db/add e :order/description (str "Order " id)]]))
 
 (defn describe-by-lookup
   "Find the eid of the order identified by `order-id` and emit a description against it."
-  [{:keys [$]} order-id]
-  [[:db/add (eid $ [:order/id order-id]) :order/description "found by lookup"]])
+  [db order-id]
+  [[:db/add (eid db [:order/id order-id]) :order/description "found by lookup"]])
 
 (def ^:private captured (atom nil))
 
-(defn capture-unresolve
-  [{:keys [resolve unresolve]} tempid existing-eid]
-  (reset! captured {:new (unresolve (resolve tempid))
-                    :existing (unresolve existing-eid)
-                    :other (unresolve :some/ident)})
-  [])
+(defn capture-args [db & args] (reset! captured {:db db :args (vec args)}) [])
 
-(defn capture-context [context] (reset! captured context) [])
-
-(defn boom [_context] (throw (ex-info "boom" {})))
+(defn boom [_db] (throw (ex-info "boom" {})))
 
 ;;; Tests
 
@@ -153,14 +146,39 @@
     (testing "nested invocations are expanded recursively"
       (is (= [[:db/add "order" :order/description "Test"]]
              (sut/| db [(list `f0 [(list `f0 [[:db/add "order" :order/description "Test"]])])]))))
-    (testing "ptx-fns receive a context of exactly :$, :resolve and :unresolve"
-      (sut/| db [(list `capture-context)])
-      (is (= #{:$ :resolve :unresolve} (set (keys @captured)))))
+    (testing "classic tx-fns are ptx-fns"
+      (is (= [[:db/add "o" :order/id 1]]
+             (sut/| db [(list `autoinc "o" :order/id)]))))
     (testing "an unresolvable ptx-fn fails"
       (is (match? {:message "Partial transaction failed."
                    :data {::sut/ptx-index 0}
                    :cause #"ptx-fn com.recbus.ptx-test/no-such-fn was not resolved"}
                   (failure db [(list `no-such-fn)]))))))
+
+(deftest tempid-marks
+  (let [db (test-db)
+        ptx0 [{:db/id "o" :order/id 1000}]]
+    (testing "ptx-fns are called with the speculative database and marks resolved to speculative eids"
+      (sut/| db ptx0 [(list `capture-args [:db/id "o"])])
+      (let [{db' :db [o] :args} @captured]
+        (is (int? o))
+        (is (= {:order/id 1000} (d/pull db' [:order/id] o)))))
+    (testing "marks are resolved anywhere in the arguments"
+      (sut/| db ptx0 [(list `capture-args {:k [[:db/id "o"]]})])
+      (is (int? (get-in @captured [:args 0 :k 0]))))
+    (testing "marks of tempids unknown to earlier ptxs resolve to the bare tempid"
+      (sut/| db ptx0 [(list `capture-args [:db/id "new"])])
+      (is (= ["new"] (:args @captured))))
+    (testing "only marks are resolved: bare tempids, map entries and non-string marks are left alone"
+      (let [args ["o" {:db/id "o"} [:db/id :order/id] [:order/id 0]]]
+        (sut/| db ptx0 [(apply list `capture-args args)])
+        (is (= args (:args @captured)))))
+    (testing "marks are resolved in the arguments of nested invocations"
+      (sut/| db ptx0 [(list `f0 [(list `capture-args [:db/id "o"])])])
+      (is (int? (get-in @captured [:args 0]))))
+    (testing "marks are not resolved in literal tx-data, where Datomic rejects them"
+      (is (match? {:data {::sut/ptx-index 1} :cause #"Unable to resolve entity: :db/id"}
+                  (failure db ptx0 [[:db/add [:db/id "o"] :order/description "x"]]))))))
 
 (deftest datomic-interprets-tx-data
   (let [db (test-db)]
@@ -195,12 +213,12 @@
         (is (= {:order/supplier {:supplier/id 3}}
                (d/pull db' [{:order/supplier [:supplier/id]}] [:order/id 1000])))))
     (testing "a ptx sees the tx-data of preceding ptxs in its database"
-      (let [db' (transact-ptxs db [{:db/id "o" :order/id 1000}] [(list `describe "o")])]
+      (let [db' (transact-ptxs db [{:db/id "o" :order/id 1000}] [(list `describe [:db/id "o"])])]
         (is (= "Order 1000" (:order/description (d/pull db' [:order/description] [:order/id 1000]))))))
     (testing "sibling elements see the same database"
       (is (= [[:db/add "o" :order/description "Order "]
               [:db/add "o" :order/id 1000]]
-             (sut/| db [(list `describe "o") [:db/add "o" :order/id 1000]]))))
+             (sut/| db [(list `describe [:db/id "o"]) [:db/add "o" :order/id 1000]]))))
     (testing "conflicting datoms fail at the ptx that introduces the conflict"
       (is (match? {:data {::sut/ptx-index 1
                           ::sut/tx-data [{:db/id "o" :order/description "Second"}]}
@@ -231,36 +249,35 @@
   (let [db (test-db)
         ptx0 [{:db/id "o" :order/id 1000} {:db/id "s" :supplier/id 3}]]
     (testing "speculative eids emitted by ptx-fns are mapped back to tempids (E and ref V)"
-      (let [ptx1 [(list `emit-resolved "o" :order/supplier "s")]]
+      (let [ptx1 [(list `emit [:db/id "o"] :order/supplier [:db/id "s"])]]
         (is (= [:db/add "o" :order/supplier "s"] (last (sut/| db ptx0 ptx1))))
         (is (= {:order/supplier {:supplier/id 3}}
                (d/pull (transact-ptxs db ptx0 ptx1) [{:order/supplier [:supplier/id]}] [:order/id 1000])))))
     (testing "... in map form"
       (is (= {:db/id "o" :order/supplier "s"}
-             (last (sut/| db ptx0 [(list `emit-resolved-map "o" :order/supplier "s")])))))
+             (last (sut/| db ptx0 [(list `emit-map [:db/id "o"] :order/supplier [:db/id "s"])])))))
     (testing "... in ref components of tuples"
-      (let [ptx1 [(list `emit-resolved-tuple "o" "s" 1)]
+      (let [ptx1 [(list `emit-tuple [:db/id "o"] [:db/id "s"] 1)]
             db' (transact-ptxs db ptx0 ptx1)]
         (is (= [:db/add "o" :order/supplier+rank ["s" 1]] (last (sut/| db ptx0 ptx1))))
         (is (= [(eid db' [:supplier/id 3]) 1]
                (:order/supplier+rank (d/pull db' [:order/supplier+rank] [:order/id 1000]))))))
     (testing "non-entity values are left alone"
       (is (= [:db/add "o" :order/description "s"]
-             (last (sut/| db ptx0 [(list `emit-resolved "o" :order/description "s")])))))
+             (last (sut/| db ptx0 [(list `emit [:db/id "o"] :order/description "s")])))))
     (testing "eids of pre-existing entities (including upsert targets) are left alone"
       (let [e0 (eid db [:order/id 0])]
         (is (= [:db/add e0 :order/description "x"]
-               (last (sut/| db [{:db/id "o" :order/id 0}] [(list `emit-resolved "o" :order/description "x")]))))))
+               (last (sut/| db [{:db/id "o" :order/id 0}] [(list `emit [:db/id "o"] :order/description "x")]))))))
     (testing "... which keeps :db/cas on an upsert target working"
       (let [e0 (eid db [:order/id 0])
             ptx0 [{:db/id "o" :order/id 0}]
-            ptx1 [(list `emit-resolved-cas "o" :order/description "Test Order 0" "Changed")]]
+            ptx1 [(list `emit-cas [:db/id "o"] :order/description "Test Order 0" "Changed")]]
         (is (= [:db/cas e0 :order/description "Test Order 0" "Changed"] (last (sut/| db ptx0 ptx1))))
         (is (= "Changed" (:order/description (d/pull (transact-ptxs db ptx0 ptx1) [:order/description] [:order/id 0]))))))
-    (testing ":unresolve is available to ptx-fns"
-      (let [e0 (eid db [:order/id 0])]
-        (sut/| db ptx0 [(list `capture-unresolve "o" e0)])
-        (is (= {:new "o" :existing e0 :other :some/ident} @captured))))
+    (testing "classic tx-fns emitting speculative eids are mapped back too"
+      (is (= [:db/add "o" :order/description "found by lookup"]
+             (last (sut/| db ptx0 [(list `describe-by-lookup 1000)])))))
     (testing "a new entity without a tempid cannot be referenced by a speculative eid"
       (is (match? {:data {::sut/ptx-index 1} :cause #"invalid-entity-id|Invalid entity id"}
                   (failure db [{:order/id 1000}] [(list `describe-by-lookup 1000)]))))))
@@ -307,29 +324,26 @@
   identified by `order-eid`) sequential value for `:order.line/number`
   for each line identified by `line-eids` starting at `step` and
   incrementing by `step`."
-  [{:keys [$ resolve] :as context} order-eid line-eids step]
-  (let [order-eid (resolve order-eid)
-        max-ln (or (ffirst (d/q {:query '{:find [(max ?ln)]
+  [db order-eid line-eids step]
+  (let [max-ln (or (ffirst (d/q {:query '{:find [(max ?ln)]
                                           :in [$ ?order]
                                           :where [[?order :order/lines ?l]
                                                   [?l :order.line/number ?ln]]}
-                                 :args [$ order-eid]}))
+                                 :args [db order-eid]}))
                    0)]
     (into []
-          (map-indexed (fn [i e] [:db/add (resolve e) :order.line/number (+ max-ln (* step (inc i)))]))
+          (map-indexed (fn [i e] [:db/add e :order.line/number (+ max-ln (* step (inc i)))]))
           line-eids)))
 
 (defn identify-line
   "Return tx-data that asserts the tuple `:order.line/order-id+number` for
   the line identified by `line` belonging to the order identified by `order`."
-  [{:keys [$ resolve] :as context} order line]
-  (let [order (resolve order)
-        line (resolve line)
-        tuple (first (d/q {:query '{:find [?order-id ?line-number]
+  [db order line]
+  (let [tuple (first (d/q {:query '{:find [?order-id ?line-number]
                                     :in [$ [?o ?l]]
                                     :where [[?o :order/id ?order-id]
                                             [?l :order.line/number ?line-number]]}
-                           :args [$ [order line]]}))]
+                           :args [db [order line]]}))]
     [[:db/add line :order.line/order-id+number tuple]]))
 
 (deftest datomic-transaction-putting-it-all-together
@@ -384,10 +398,10 @@
                                           :order.line/part-number "B"}]}
                           [:db/add "order0" :order/created-by "datomic.tx"]
                           [:db/add "datomic.tx" :db/ident :test/transaction]
-                          (com.recbus.ptx/|+ ~`autoinc "order0" :order/id)])
-          ptx1 (template #{(~`enumerate-lines "order0" ["line00" "line01"] 10)})
-          ptx2 (template #{(~`identify-line "order0" "line00")
-                           (~`identify-line "order0" "line01")})
+                          (~`autoinc "order0" :order/id)])
+          ptx1 (template #{(~`enumerate-lines [:db/id "order0"] [[:db/id "line00"] [:db/id "line01"]] 10)})
+          ptx2 (template #{(~`identify-line [:db/id "order0"] [:db/id "line00"])
+                           (~`identify-line [:db/id "order0"] [:db/id "line01"])})
           tx-data (template [(com.recbus.ptx/| ~ptx0 ~ptx1 ~ptx2)])
           {{o "order0"} :tempids :keys [db-after]} (d/with (:db-after %) {:tx-data tx-data})
           selector '[*

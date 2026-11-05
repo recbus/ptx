@@ -63,7 +63,7 @@ A **ptx** is a collection of tx-data elements. Each element can be:
 
 | Element | Example | Meaning |
 |---|---|---|
-| ptx-fn invocation | `(my.ns/enumerate-lines "order" ["l0" "l1"] 10)` | A list (or other seq) with a fully qualified symbol in function position. Calls the ptx-fn and recursively expands the ptx it returns. |
+| ptx-fn invocation | `(my.ns/enumerate-lines [:db/id "order"] [[:db/id "l0"] [:db/id "l1"]] 10)` | A list (or other seq) with a fully qualified symbol in function position. Calls the ptx-fn and recursively expands the ptx it returns. |
 | Anything else | `{:db/id "order" :order/id 1}`, `[:db/add "order" :order/id 1]`, `[:db/cas …]` | Passed through unchanged and interpreted by Datomic, with Datomic's own semantics for map forms, nesting, lookup refs, tuples, retractions, etc. |
 
 Sibling elements in a ptx are evaluated independently against the same
@@ -78,55 +78,65 @@ against values asserted by earlier ptxs.
 
 ### Writing ptx-fns
 
-A ptx-fn is an ordinary Clojure function. It takes a `context` as its first
-argument, followed by the arguments from the invocation, and returns a ptx.
-The context contains:
-
-* `:$`: the speculative database, including all facts from earlier ptxs.
-* `:resolve`: a function that maps a tempid from an earlier ptx to its
-  speculative entity id. Values it doesn't recognize are returned unchanged.
-* `:unresolve`: the inverse of `:resolve`. It maps the speculative entity id of
-  an entity created by an earlier ptx back to its tempid. Values it doesn't
-  recognize are returned unchanged.
+A ptx-fn has the same signature as a classic Datomic tx-fn: `(f db & args)`.
+`db` is the speculative database, including all facts from earlier ptxs, and
+the ptx-fn returns a ptx. Any classic tx-fn can therefore be invoked as a
+ptx-fn, and a ptx-fn needs no knowledge of `ptx`.
 
 ```clojure
 (defn enumerate-lines
   "Number the lines of an order, continuing from its highest existing line number."
-  [{:keys [$ resolve]} order line-tempids step]
-  (let [order (resolve order)
-        max-ln (or (ffirst (d/q {:query '{:find [(max ?ln)]
+  [db order lines step]
+  (let [max-ln (or (ffirst (d/q {:query '{:find [(max ?ln)]
                                           :in [$ ?o]
                                           :where [[?o :order/lines ?l]
                                                   [?l :order.line/number ?ln]]}
-                                 :args [$ order]}))
+                                 :args [db order]}))
                    0)]
     (into []
-          (map-indexed (fn [i l] [:db/add (resolve l) :order.line/number (+ max-ln (* step (inc i)))]))
-          line-tempids)))
+          (map-indexed (fn [i l] [:db/add l :order.line/number (+ max-ln (* step (inc i)))]))
+          lines)))
 ```
+
+#### Referring to tempids of earlier ptxs: `[:db/id "tempid"]`
+
+The speculative database contains entity ids, not tempids, so a ptx-fn that
+reads the database needs the speculative entity ids of entities created by
+earlier ptxs. The author of the tx-data, who knows which arguments are tempids,
+marks them at the call site as `[:db/id "tempid"]`:
 
 ```clojure
 (def ptx0 [{:db/id "order"
             :order/id 1000
             :order/lines [{:db/id "l0" :order.line/part-number "A"}
                           {:db/id "l1" :order.line/part-number "B"}]}])
-(def ptx1 [(list `enumerate-lines "order" ["l0" "l1"] 10)])
+(def ptx1 [(list `enumerate-lines [:db/id "order"] [[:db/id "l0"] [:db/id "l1"]] 10)])
 
 (d/transact conn {:tx-data [(list 'com.recbus.ptx/| ptx0 ptx1)]})
 ```
 
-Because `ptx1` runs after `ptx0`, the order and its lines are already in
-`:$`, and `resolve` maps `"order"`, `"l0"` and `"l1"` to their speculative
-entity ids.
+Before calling the ptx-fn, `ptx` replaces each mark with the speculative entity
+id of its tempid, so `enumerate-lines` receives entity ids it can query with.
+The rules:
+
+* A mark is a two-element vector whose first element is `:db/id` and whose
+  second element is a string. Other values, including bare tempid strings,
+  `[:db/id :some/attr]` (e.g. in a pull pattern) and `:db/id` entries of map
+  arguments, are left alone.
+* Marks are resolved anywhere in the arguments of a ptx-fn invocation, however
+  deeply nested, including in invocations emitted by other ptx-fns.
+* A mark whose tempid was not used by an earlier ptx resolves to the bare
+  tempid. (Sibling elements of the same ptx cannot see each other.)
+* Marks are only resolved in ptx-fn arguments. Datomic has no meaning for
+  `[:db/id …]`, so a mark in literal tx-data is rejected.
 
 #### Speculative entity ids in ptx-fn output
 
 A speculative entity id is only valid in the speculative database it came from;
 the final transaction has to refer to the same entity by its tempid. `ptx`
 handles this automatically: every speculative entity id of a *new* entity in a
-ptx-fn's output is replaced with its tempid. So `enumerate-lines` above may emit
-`(resolve l)`, as shown, or just `l`; both produce `[:db/add "l0" …]`. Calling
-`unresolve` yourself is optional, but makes the output explicit.
+ptx-fn's output is replaced with its tempid. So when `enumerate-lines` above
+emits the entity ids it received, the result is `[:db/add "l0" …]`.
 
 The replacement walks the output without regard to its structure. That is
 almost always safe: a speculative entity id is only meaningful where an entity
@@ -140,16 +150,6 @@ Entity ids of entities that existed before the transaction (including upsert
 targets) are valid everywhere and are left alone. Replacing them would break,
 for example, a `:db/cas` on an upserted entity: Datomic evaluates `:db/cas`
 before it resolves tempids by upsert.
-
-### Wrapping classic tx-fns: `|+`
-
-Use `com.recbus.ptx/|+` to call an existing Datomic-style transaction function
-(`(f db & args)`) from inside a ptx. It is called with the current speculative
-database. Tempids in its arguments are **not** resolved.
-
-```clojure
-[(list 'com.recbus.ptx/|+ `my.ns/autoinc "order" :order/id)]
-```
 
 ### Errors
 
@@ -167,8 +167,9 @@ a ptx-fn or from Datomic. Its data contains:
   quadratically with the number of ptxs. This is negligible for a handful of
   ptxs, but avoid long sequences of ptxs following a large one.
 * A list (or other seq) with a qualified symbol in function position is always
-  treated as a ptx-fn invocation. Classic Datomic tx-fns can be called with `|+`,
-  or written as vectors so they pass through to Datomic.
+  treated as a ptx-fn invocation, evaluated by `ptx` against the speculative
+  database. To have Datomic call a tx-fn instead (against the original
+  database, without mark resolution), write the invocation as a vector.
 * A ptx-fn can only refer to a new entity from an earlier ptx if that entity has
   a tempid. Entities created by maps without a `:db/id` (including nested
   component maps) have none, so emitting their speculative entity ids fails with
