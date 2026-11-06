@@ -20,6 +20,10 @@
   against the original database, tempids unify natively and the speculative
   database seen by each ptx has exactly the semantics of the final transaction.
 
+  Each ptx is written as ptx-data enclosed in a set: tx-data elements and ptx-fn
+  invocations.  The set expresses that sibling elements are independent; they
+  are evaluated against the same database, in no particular order.
+
   A ptx-fn has the same signature as a classic Datomic tx-fn, `(f db & args)`,
   where `db` is the speculative database.  Arguments that refer to tempids of
   earlier ptxs are marked at the call site as `[:db/id \"tempid\"]` and are
@@ -134,7 +138,9 @@
   [db ptxs]
   (let [existing? (memoize (partial existing-entity? db))]
     (:tx-data (reduce (fn [{:keys [tx-data] :as state} [index ptx]]
-                        (let [tx-data' (try (expand-ptx state ptx)
+                        (let [tx-data' (try (when-not (set? ptx)
+                                              (throw (ex-info "ptx-data must be enclosed in a set." {::ptx ptx})))
+                                            (expand-ptx state ptx)
                                             (catch Exception e (fail index nil e)))
                               tx-data (into tx-data tx-data')
                               report (try (d/with db {:tx-data tx-data})
@@ -146,6 +152,6 @@
 ;; The sole entry point.
 (defn |
   "A Datomic tx-fn that generates tx-data from `ptxs`, a sequence of partial
-  transactions."
+  transactions.  Each ptx is ptx-data enclosed in a set."
   [db & ptxs]
   (apply-ptxs db ptxs))

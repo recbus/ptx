@@ -113,179 +113,195 @@
 
 ;;; Tests
 
+(deftest ptx-data-must-be-enclosed-in-a-set
+  (let [db (test-db)]
+    (testing "non-set ptx arguments are rejected and attributed to their position"
+      (doseq [ptx [[[:db/add "o" :order/id 1]]
+                   (list [:db/add "o" :order/id 1])
+                   {:db/id "o" :order/id 1}]]
+        (is (match? {:message "Partial transaction failed."
+                     :data (m/equals {::sut/ptx-index 1})
+                     :cause "ptx-data must be enclosed in a set."}
+                    (failure db #{{:db/id "p" :order/id 2}} ptx)))))
+    (testing "an empty set is a valid ptx"
+      (is (= [] (sut/| db #{}))))
+    (testing "ptx-fns may return any collection"
+      (is (= [[:db/add "o" :order/id 1]]
+             (sut/| db #{(list `f0 [[:db/add "o" :order/id 1]])})
+             (sut/| db #{(list `f0 (list [:db/add "o" :order/id 1]))}))))))
+
 (deftest literal-tx-data-passes-through
   (let [db (test-db)]
     (testing "primitives"
-      (let [ptx0 [[:db/add "order" :order/id 1000]
-                  [:db/retract [:order/id 0] :order/description "Test Order 0"]
-                  [:db/cas [:order/id 0] :order/description "Test Order 0" "Changed"]]]
-        (is (= ptx0 (sut/| db ptx0)))))
+      (let [ptx0 #{[:db/add "order" :order/id 1000]
+                   [:db/retract [:order/id 0] :order/description "Test Order 0"]
+                   [:db/cas [:order/id 0] :order/description "Test Order 0" "Changed"]}]
+        (is (= ptx0 (set (sut/| db ptx0))))))
     (testing "map forms, including nesting, cardinality-many, tuples and lookup refs"
-      (let [ptx0 [{:db/id "order"
-                   :order/id 1000
-                   :order/origin ["US" "TX"]
-                   :order/tags [:order/big :order/important]
-                   :order/related [[:supplier/id 1] [:supplier/id 2]]
-                   :order/lines [{:order.line/part-number "A"}]}]]
-        (is (= ptx0 (sut/| db ptx0)))))
-    (testing "the tx-data of multiple ptxs is concatenated"
-      (let [ptx0 [{:db/id "order0" :order/id 1000}]
-            ptx1 [{:db/id "order1" :order/id 1001}]]
-        (is (= (into ptx0 ptx1) (sut/| db ptx0 ptx1)))))))
+      (let [ptx0 #{{:db/id "order"
+                    :order/id 1000
+                    :order/origin ["US" "TX"]
+                    :order/tags [:order/big :order/important]
+                    :order/related [[:supplier/id 1] [:supplier/id 2]]
+                    :order/lines [{:order.line/part-number "A"}]}}]
+        (is (= ptx0 (set (sut/| db ptx0))))))
+    (testing "the tx-data of multiple ptxs is concatenated in order"
+      (is (= [{:db/id "order0" :order/id 1000} {:db/id "order1" :order/id 1001}]
+             (sut/| db #{{:db/id "order0" :order/id 1000}} #{{:db/id "order1" :order/id 1001}}))))))
 
 (deftest ptx-fn-expansion
   (let [db (test-db)]
     (testing "invocation as a list"
-      (is (= [{:db/id "order" :order/id 1000}
-              [:db/add "order" :order/description "Test"]]
-             (sut/| db [{:db/id "order" :order/id 1000}
-                        (list `f0 [[:db/add "order" :order/description "Test"]])]))))
+      (is (= #{{:db/id "order" :order/id 1000}
+               [:db/add "order" :order/description "Test"]}
+             (set (sut/| db #{{:db/id "order" :order/id 1000}
+                              (list `f0 [[:db/add "order" :order/description "Test"]])})))))
     (testing "invocation as a lazy seq, as produced by the Datomic Cloud tx processor"
       (is (= [[:db/add "order" :order/description "Test"]]
-             (sut/| db [(lazy-seq (list `f0 [[:db/add "order" :order/description "Test"]]))]))))
+             (sut/| db #{(lazy-seq (list `f0 [[:db/add "order" :order/description "Test"]]))}))))
     (testing "nested invocations are expanded recursively"
       (is (= [[:db/add "order" :order/description "Test"]]
-             (sut/| db [(list `f0 [(list `f0 [[:db/add "order" :order/description "Test"]])])]))))
+             (sut/| db #{(list `f0 [(list `f0 [[:db/add "order" :order/description "Test"]])])}))))
     (testing "classic tx-fns are ptx-fns"
       (is (= [[:db/add "o" :order/id 1]]
-             (sut/| db [(list `autoinc "o" :order/id)]))))
+             (sut/| db #{(list `autoinc "o" :order/id)}))))
     (testing "an unresolvable ptx-fn fails"
       (is (match? {:message "Partial transaction failed."
                    :data {::sut/ptx-index 0}
                    :cause #"ptx-fn com.recbus.ptx-test/no-such-fn was not resolved"}
-                  (failure db [(list `no-such-fn)]))))))
+                  (failure db #{(list `no-such-fn)}))))))
 
 (deftest tempid-marks
   (let [db (test-db)
-        ptx0 [{:db/id "o" :order/id 1000}]]
+        ptx0 #{{:db/id "o" :order/id 1000}}]
     (testing "ptx-fns are called with the speculative database and marks resolved to speculative eids"
-      (sut/| db ptx0 [(list `capture-args [:db/id "o"])])
+      (sut/| db ptx0 #{(list `capture-args [:db/id "o"])})
       (let [{db' :db [o] :args} @captured]
         (is (int? o))
         (is (= {:order/id 1000} (d/pull db' [:order/id] o)))))
     (testing "marks are resolved anywhere in the arguments"
-      (sut/| db ptx0 [(list `capture-args {:k [[:db/id "o"]]})])
+      (sut/| db ptx0 #{(list `capture-args {:k [[:db/id "o"]]})})
       (is (int? (get-in @captured [:args 0 :k 0]))))
     (testing "marks of tempids unknown to earlier ptxs resolve to the bare tempid"
-      (sut/| db ptx0 [(list `capture-args [:db/id "new"])])
+      (sut/| db ptx0 #{(list `capture-args [:db/id "new"])})
       (is (= ["new"] (:args @captured))))
     (testing "only marks are resolved: bare tempids, map entries and non-string marks are left alone"
       (let [args ["o" {:db/id "o"} [:db/id :order/id] [:order/id 0]]]
-        (sut/| db ptx0 [(apply list `capture-args args)])
+        (sut/| db ptx0 #{(apply list `capture-args args)})
         (is (= args (:args @captured)))))
     (testing "marks are resolved in the arguments of nested invocations"
-      (sut/| db ptx0 [(list `f0 [(list `capture-args [:db/id "o"])])])
+      (sut/| db ptx0 #{(list `f0 [(list `capture-args [:db/id "o"])])})
       (is (int? (get-in @captured [:args 0]))))
     (testing "marks are not resolved in literal tx-data, where Datomic rejects them"
       (is (match? {:data {::sut/ptx-index 1} :cause #"Unable to resolve entity: :db/id"}
-                  (failure db ptx0 [[:db/add [:db/id "o"] :order/description "x"]]))))))
+                  (failure db ptx0 #{[:db/add [:db/id "o"] :order/description "x"]}))))))
 
 (deftest datomic-interprets-tx-data
   (let [db (test-db)]
     (testing "a cardinality-many ref of idents is not mistaken for a lookup ref"
-      (let [db' (transact-ptxs db [{:order/id 1000 :order/related [:related/A :related/B]}])]
+      (let [db' (transact-ptxs db #{{:order/id 1000 :order/related [:related/A :related/B]}})]
         (is (= #{:related/A :related/B}
                (into #{} (map :db/ident) (:order/related (d/pull db' [{:order/related [:db/ident]}] [:order/id 1000])))))))
     (testing "reverse refs are interpreted by Datomic"
-      (let [db' (transact-ptxs db [{:db/id "line" :order.line/part-number "X"}
-                                   {:db/id "order" :order/id 1000 :order.line/_order "line"}])]
+      (let [db' (transact-ptxs db #{{:db/id "line" :order.line/part-number "X"}
+                                    {:db/id "order" :order/id 1000 :order.line/_order "line"}})]
         (is (= [{:order.line/part-number "X"}]
                (:order.line/_order (d/pull db' [{:order.line/_order [:order.line/part-number]}] [:order/id 1000]))))))
     (testing "invalid values are rejected, not silently dropped"
       (is (match? {:data {::sut/ptx-index 0} :cause #"invalid-lookup-ref"}
-                  (failure db [{:order/id 1000 :order/related [[:related/A]]}]))))
+                  (failure db #{{:order/id 1000 :order/related [[:related/A]]}}))))
     (testing "classic tx-fns written as vectors pass through to Datomic"
-      (let [ptx0 [{:db/id "o" :order/description "classic"}]
-            ptx1 [[`autoinc "o" :order/id]]]
-        (is (= (into ptx0 ptx1) (sut/| db ptx0 ptx1)))
+      (let [ptx0 #{{:db/id "o" :order/description "classic"}}
+            ptx1 #{[`autoinc "o" :order/id]}]
+        (is (= (into (vec ptx0) ptx1) (sut/| db ptx0 ptx1)))
         (is (= "classic" (:order/description (d/pull (transact-ptxs db ptx0 ptx1) [:order/description] [:order/id 1]))))))
     (testing "a nested non-component entity without :db/id is rejected"
       (is (match? {:data {::sut/ptx-index 0} :cause #"invalid-nested-entity"}
-                  (failure db [{:order/id 1000 :order/supplier {:order/description "orphan"}}]))))))
+                  (failure db #{{:order/id 1000 :order/supplier {:order/description "orphan"}}}))))))
 
 (deftest composition
   (let [db (test-db)]
     (testing "tempids unify across ptxs in E position"
-      (let [db' (transact-ptxs db [{:db/id "o" :order/id 1000}] [{:db/id "o" :order/description "Later"}])]
+      (let [db' (transact-ptxs db #{{:db/id "o" :order/id 1000}} #{{:db/id "o" :order/description "Later"}})]
         (is (= "Later" (:order/description (d/pull db' [:order/description] [:order/id 1000]))))))
     (testing "tempids unify across ptxs in V position"
-      (let [db' (transact-ptxs db [{:db/id "s" :supplier/id 3}] [{:order/id 1000 :order/supplier "s"}])]
+      (let [db' (transact-ptxs db #{{:db/id "s" :supplier/id 3}} #{{:order/id 1000 :order/supplier "s"}})]
         (is (= {:order/supplier {:supplier/id 3}}
                (d/pull db' [{:order/supplier [:supplier/id]}] [:order/id 1000])))))
     (testing "a ptx sees the tx-data of preceding ptxs in its database"
-      (let [db' (transact-ptxs db [{:db/id "o" :order/id 1000}] [(list `describe [:db/id "o"])])]
+      (let [db' (transact-ptxs db #{{:db/id "o" :order/id 1000}} #{(list `describe [:db/id "o"])})]
         (is (= "Order 1000" (:order/description (d/pull db' [:order/description] [:order/id 1000]))))))
     (testing "sibling elements see the same database"
-      (is (= [[:db/add "o" :order/description "Order "]
-              [:db/add "o" :order/id 1000]]
-             (sut/| db [(list `describe [:db/id "o"]) [:db/add "o" :order/id 1000]]))))
+      (is (= #{[:db/add "o" :order/description "Order "]
+               [:db/add "o" :order/id 1000]}
+             (set (sut/| db #{(list `describe [:db/id "o"]) [:db/add "o" :order/id 1000]})))))
     (testing "conflicting datoms fail at the ptx that introduces the conflict"
       (is (match? {:data {::sut/ptx-index 1
                           ::sut/tx-data [{:db/id "o" :order/description "Second"}]}
                    :cause #"conflict"}
                   (failure db
-                           [{:db/id "o" :order/id 1000 :order/description "First"}]
-                           [{:db/id "o" :order/description "Second"}]))))
+                           #{{:db/id "o" :order/id 1000 :order/description "First"}}
+                           #{{:db/id "o" :order/description "Second"}}))))
     (testing ":db/cas is evaluated against the original database, as in the final transaction"
       (is (match? {:data {::sut/ptx-index 1} :cause #"cas-failed|Compare failed"}
                   (failure db
-                           [[:db/add [:order/id 0] :order/description "a"]]
-                           [[:db/cas [:order/id 0] :order/description "a" "b"]])))
+                           #{[:db/add [:order/id 0] :order/description "a"]}
+                           #{[:db/cas [:order/id 0] :order/description "a" "b"]})))
       (let [db' (transact-ptxs db
-                               [{:order/id 1000}]
-                               [[:db/cas [:order/id 0] :order/description "Test Order 0" "Changed"]])]
+                               #{{:order/id 1000}}
+                               #{[:db/cas [:order/id 0] :order/description "Test Order 0" "Changed"]})]
         (is (= "Changed" (:order/description (d/pull db' [:order/description] [:order/id 0]))))))
     (testing "short-form and long-form retractions of pre-existing data"
       (let [db' (transact-ptxs db
-                               [[:db/retract [:order/id 0] :order/description]]
-                               [[:db/retract [:order/id 0] :order/supplier :test/supplierA]])]
+                               #{[:db/retract [:order/id 0] :order/description]}
+                               #{[:db/retract [:order/id 0] :order/supplier :test/supplierA]})]
         (is (= {:order/id 0} (d/pull db' [:order/id :order/description :order/supplier] [:order/id 0])))))
     (testing "lookup refs in a cardinality-many ref"
-      (let [db' (transact-ptxs db [{:order/id 1000 :order/related [[:supplier/id 1] [:supplier/id 2]]}])]
+      (let [db' (transact-ptxs db #{{:order/id 1000 :order/related [[:supplier/id 1] [:supplier/id 2]]}})]
         (is (= #{1 2}
                (into #{} (map :supplier/id) (:order/related (d/pull db' [{:order/related [:supplier/id]}] [:order/id 1000])))))))))
 
 (deftest speculative-eids
   (let [db (test-db)
-        ptx0 [{:db/id "o" :order/id 1000} {:db/id "s" :supplier/id 3}]]
+        ptx0 #{{:db/id "o" :order/id 1000} {:db/id "s" :supplier/id 3}}]
     (testing "speculative eids emitted by ptx-fns are mapped back to tempids (E and ref V)"
-      (let [ptx1 [(list `emit [:db/id "o"] :order/supplier [:db/id "s"])]]
+      (let [ptx1 #{(list `emit [:db/id "o"] :order/supplier [:db/id "s"])}]
         (is (= [:db/add "o" :order/supplier "s"] (last (sut/| db ptx0 ptx1))))
         (is (= {:order/supplier {:supplier/id 3}}
                (d/pull (transact-ptxs db ptx0 ptx1) [{:order/supplier [:supplier/id]}] [:order/id 1000])))))
     (testing "... in map form"
       (is (= {:db/id "o" :order/supplier "s"}
-             (last (sut/| db ptx0 [(list `emit-map [:db/id "o"] :order/supplier [:db/id "s"])])))))
+             (last (sut/| db ptx0 #{(list `emit-map [:db/id "o"] :order/supplier [:db/id "s"])})))))
     (testing "... in ref components of tuples"
-      (let [ptx1 [(list `emit-tuple [:db/id "o"] [:db/id "s"] 1)]
+      (let [ptx1 #{(list `emit-tuple [:db/id "o"] [:db/id "s"] 1)}
             db' (transact-ptxs db ptx0 ptx1)]
         (is (= [:db/add "o" :order/supplier+rank ["s" 1]] (last (sut/| db ptx0 ptx1))))
         (is (= [(eid db' [:supplier/id 3]) 1]
                (:order/supplier+rank (d/pull db' [:order/supplier+rank] [:order/id 1000]))))))
     (testing "non-entity values are left alone"
       (is (= [:db/add "o" :order/description "s"]
-             (last (sut/| db ptx0 [(list `emit [:db/id "o"] :order/description "s")])))))
+             (last (sut/| db ptx0 #{(list `emit [:db/id "o"] :order/description "s")})))))
     (testing "eids of pre-existing entities (including upsert targets) are left alone"
       (let [e0 (eid db [:order/id 0])]
         (is (= [:db/add e0 :order/description "x"]
-               (last (sut/| db [{:db/id "o" :order/id 0}] [(list `emit [:db/id "o"] :order/description "x")]))))))
+               (last (sut/| db #{{:db/id "o" :order/id 0}} #{(list `emit [:db/id "o"] :order/description "x")}))))))
     (testing "... which keeps :db/cas on an upsert target working"
       (let [e0 (eid db [:order/id 0])
-            ptx0 [{:db/id "o" :order/id 0}]
-            ptx1 [(list `emit-cas [:db/id "o"] :order/description "Test Order 0" "Changed")]]
+            ptx0 #{{:db/id "o" :order/id 0}}
+            ptx1 #{(list `emit-cas [:db/id "o"] :order/description "Test Order 0" "Changed")}]
         (is (= [:db/cas e0 :order/description "Test Order 0" "Changed"] (last (sut/| db ptx0 ptx1))))
         (is (= "Changed" (:order/description (d/pull (transact-ptxs db ptx0 ptx1) [:order/description] [:order/id 0]))))))
     (testing "classic tx-fns emitting speculative eids are mapped back too"
       (is (= [:db/add "o" :order/description "found by lookup"]
-             (last (sut/| db ptx0 [(list `describe-by-lookup 1000)])))))
+             (last (sut/| db ptx0 #{(list `describe-by-lookup 1000)})))))
     (testing "a new entity without a tempid cannot be referenced by a speculative eid"
       (is (match? {:data {::sut/ptx-index 1} :cause #"invalid-entity-id|Invalid entity id"}
-                  (failure db [{:order/id 1000}] [(list `describe-by-lookup 1000)]))))))
+                  (failure db #{{:order/id 1000}} #{(list `describe-by-lookup 1000)}))))))
 
 (deftest distinguishable-exceptions
   (let [db (test-db)
-        ptx0 [{:db/id "order0" :order/id 1000}]
-        ptx1 [[:db/add [:order/id 1001] :order/tags :order/big]]]
+        ptx0 #{{:db/id "order0" :order/id 1000}}
+        ptx1 #{[:db/add [:order/id 1001] :order/tags :order/big]}]
     (testing "failures are attributed to the responsible ptx"
       (try
         (d/with db {:tx-data [(list `sut/| ptx0 ptx1)]})
@@ -298,14 +314,14 @@
                               :db/error :db.error/not-an-entity}
                        :via [{:message "Partial transaction failed."
                               :data {::sut/ptx-index 1
-                                     ::sut/tx-data ptx1}}
+                                     ::sut/tx-data (vec ptx1)}}
                              {:data {:db/error :db.error/not-an-entity}}]})
                e)))))
     (testing "ptx-fn failures are attributed to the responsible ptx"
       (is (match? {:message "Partial transaction failed."
                    :data (m/equals {::sut/ptx-index 1})
                    :cause "boom"}
-                  (failure db ptx0 [(list `boom)]))))))
+                  (failure db ptx0 #{(list `boom)}))))))
 
 ;; Functions used to exercise ptx with real-world requirements
 (defn autoinc
@@ -388,17 +404,17 @@
                           :db/unique :db.unique/identity
                           :db/cardinality :db.cardinality/one}]})
     (d/with (:db-after %) {:tx-data [[:db/add "supplier" :db/ident :test/supplierA]]})
-    (let [ptx0 (template [{:db/id "order0"
-                           :db/ident :test/orderA
-                           :order/supplier :test/supplierA
-                           :order/description "Test Order 0"
-                           :order/lines [{:db/id "line00"
-                                          :order.line/part-number "A"}
-                                         {:db/id "line01"
-                                          :order.line/part-number "B"}]}
-                          [:db/add "order0" :order/created-by "datomic.tx"]
-                          [:db/add "datomic.tx" :db/ident :test/transaction]
-                          (~`autoinc "order0" :order/id)])
+    (let [ptx0 (template #{{:db/id "order0"
+                            :db/ident :test/orderA
+                            :order/supplier :test/supplierA
+                            :order/description "Test Order 0"
+                            :order/lines [{:db/id "line00"
+                                           :order.line/part-number "A"}
+                                          {:db/id "line01"
+                                           :order.line/part-number "B"}]}
+                           [:db/add "order0" :order/created-by "datomic.tx"]
+                           [:db/add "datomic.tx" :db/ident :test/transaction]
+                           (~`autoinc "order0" :order/id)})
           ptx1 (template #{(~`enumerate-lines [:db/id "order0"] [[:db/id "line00"] [:db/id "line01"]] 10)})
           ptx2 (template #{(~`identify-line [:db/id "order0"] [:db/id "line00"])
                            (~`identify-line [:db/id "order0"] [:db/id "line01"])})

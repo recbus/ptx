@@ -59,11 +59,20 @@ Call `com.recbus.ptx/|` in your tx-data, passing one or more ptxs:
 (d/transact conn {:tx-data [(list 'com.recbus.ptx/| ptx0 ptx1 ptx2)]})
 ```
 
-A **ptx** is a collection of tx-data elements. Each element can be:
+Each ptx is written as **ptx-data enclosed in a set**:
+
+```clojure
+(def ptx0 #{{:db/id "order" :order/id 1000}
+            [:db/add "order" :order/description "Rush"]})
+```
+
+The set is required; any other argument to `|` is rejected. It expresses that
+the elements of a ptx are independent of each other: they are evaluated against
+the same database, in no particular order. Each element of ptx-data can be:
 
 | Element | Example | Meaning |
 |---|---|---|
-| ptx-fn invocation | `(my.ns/enumerate-lines [:db/id "order"] [[:db/id "l0"] [:db/id "l1"]] 10)` | A list (or other seq) with a fully qualified symbol in function position. Calls the ptx-fn and recursively expands the ptx it returns. |
+| ptx-fn invocation | `(my.ns/enumerate-lines [:db/id "order"] [[:db/id "l0"] [:db/id "l1"]] 10)` | A list (or other seq) with a fully qualified symbol in function position. Calls the ptx-fn and recursively expands the tx-data it returns. |
 | Anything else | `{:db/id "order" :order/id 1}`, `[:db/add "order" :order/id 1]`, `[:db/cas …]` | Passed through unchanged and interpreted by Datomic, with Datomic's own semantics for map forms, nesting, lookup refs, tuples, retractions, etc. |
 
 Sibling elements in a ptx are evaluated independently against the same
@@ -80,8 +89,9 @@ against values asserted by earlier ptxs.
 
 A ptx-fn has the same signature as a classic Datomic tx-fn: `(f db & args)`.
 `db` is the speculative database, including all facts from earlier ptxs, and
-the ptx-fn returns a ptx. Any classic tx-fn can therefore be invoked as a
-ptx-fn, and a ptx-fn needs no knowledge of `ptx`.
+the ptx-fn returns tx-data (any collection, which may itself contain ptx-fn
+invocations). Any classic tx-fn can therefore be invoked as a ptx-fn, and a
+ptx-fn needs no knowledge of `ptx`.
 
 ```clojure
 (defn enumerate-lines
@@ -106,11 +116,11 @@ earlier ptxs. The author of the tx-data, who knows which arguments are tempids,
 marks them at the call site as `[:db/id "tempid"]`:
 
 ```clojure
-(def ptx0 [{:db/id "order"
-            :order/id 1000
-            :order/lines [{:db/id "l0" :order.line/part-number "A"}
-                          {:db/id "l1" :order.line/part-number "B"}]}])
-(def ptx1 [(list `enumerate-lines [:db/id "order"] [[:db/id "l0"] [:db/id "l1"]] 10)])
+(def ptx0 #{{:db/id "order"
+             :order/id 1000
+             :order/lines [{:db/id "l0" :order.line/part-number "A"}
+                           {:db/id "l1" :order.line/part-number "B"}]}})
+(def ptx1 #{(list `enumerate-lines [:db/id "order"] [[:db/id "l0"] [:db/id "l1"]] 10)})
 
 (d/transact conn {:tx-data [(list 'com.recbus.ptx/| ptx0 ptx1)]})
 ```
@@ -155,7 +165,8 @@ before it resolves tempids by upsert.
 
 If a ptx fails, `ptx` throws an `ex-info` with the message
 `"Partial transaction failed."`. Its cause is the underlying error, either from
-a ptx-fn or from Datomic. Its data contains:
+a ptx-fn, from Datomic, or `"ptx-data must be enclosed in a set."` for an
+argument to `|` that is not a set. Its data contains:
 
 * `:com.recbus.ptx/ptx-index`: the (zero-based) position of the failing ptx.
 * `:com.recbus.ptx/tx-data`: the expanded tx-data of the failing ptx, when the
